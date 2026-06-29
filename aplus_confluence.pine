@@ -1,0 +1,307 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © rb — A+ ICT Suite (Rejection Blocks + FVG + Order Blocks)
+//@version=6
+indicator("A+ ICT Suite [rb]", shorttitle="A+ Suite", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Unified A+ detector for all three rb concepts in one indicator:
+//    • Rejection Blocks  — swing-wick zones (fade edge, best RR≈1)
+//    • Fair Value Gaps   — 3-candle imbalance (continuation, best RR 2-3)
+//    • Order Blocks      — last opposing candle before a BOS (continuation, RR≈2)
+//
+//  Each zone is graded 0-100 by its own validated factor set and (by default)
+//  only A+ (≥80) zones are drawn.
+//
+//  IMPORTANT — confluence finding (backtest, 12 markets):
+//  Overlapping zones of different types do NOT outperform — they UNDER-perform
+//  (chop/exhaustion areas whipsaw). Grade beats confluence. So overlap is only
+//  an optional, off-by-default visual marker here, NOT a quality boost.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Which concepts to show ──
+gE = "Concepts"
+enRB  = input.bool(true, "Rejection Blocks", group=gE, inline="e1")
+enFVG = input.bool(true, "Fair Value Gaps",  group=gE, inline="e1")
+enOB  = input.bool(true, "Order Blocks",     group=gE, inline="e2")
+
+gG = "Grade"
+minGrade = input.string("A+ only", "Minimum grade", options=["A+ only","A and above","B and above","Show all"], group=gG, tooltip="Applies to all concepts. Note: for FVGs the grade is roughly flat in backtests, so A+ only will show very few — lower to 'B and above' if you want more FVGs.")
+
+// ── Core calibration (shared) ──
+gC = "Calibration"
+pivotLen   = input.int(5,  "Swing strength", minval=1, maxval=50, group=gC)
+sweepLook  = input.int(20, "Sweep lookback", minval=2, group=gC)
+scanBack   = input.int(10, "OB scan-back",   minval=1, maxval=50, group=gC)
+atrLen     = input.int(14, "ATR length",   minval=1, group=gC)
+volLen     = input.int(20, "Volume avg len", minval=1, group=gC)
+trendLen   = input.int(50, "Trend EMA len",  minval=1, group=gC)
+
+gF = "Hard filters"
+minWick    = input.float(0.5,  "RB min wick/range",   minval=0, maxval=1, step=0.05, group=gF)
+minRngATR  = input.float(0.5,  "RB min range (ATR)",  minval=0, step=0.1, group=gF)
+minGapATR  = input.float(0.25, "FVG min gap (ATR)",   minval=0, step=0.05, group=gF)
+minDispATR = input.float(1.0,  "OB min displacement (ATR)", minval=0, step=0.1, group=gF)
+
+gV = "Display"
+maxZones  = input.int(24, "Max zones kept", minval=1, maxval=120, group=gV)
+showCE    = input.bool(true,  "Show 50% (CE) lines", group=gV)
+showLbl   = input.bool(true,  "Show grade labels", group=gV)
+showTbl   = input.bool(true,  "Show dashboard", group=gV)
+markOv    = input.bool(false, "Mark overlaps (info only)", group=gV, tooltip="Draws an ✦ where two A+ zones of different types overlap. Backtest shows overlaps do NOT improve edge — purely informational.")
+// Each concept has its OWN colour in BOTH directions, so all three are distinct on
+// the chart. Direction is shown by shade (bull = bright, bear = dark), a solid vs
+// dashed border, and a ▲/▼ in the label — never by collapsing concepts to one red.
+rbColUp   = input.color(#26c4ad, "Rejection Block  ▲", group=gV, inline="rb")
+rbColDn   = input.color(#0f7d6e, "▼", group=gV, inline="rb")
+fvgColUp  = input.color(#5b9cf6, "Fair Value Gap   ▲", group=gV, inline="fv")
+fvgColDn  = input.color(#2a52b8, "▼", group=gV, inline="fv")
+obColUp   = input.color(#f0b341, "Order Block      ▲", group=gV, inline="ob")
+obColDn   = input.color(#a8761f, "▼", group=gV, inline="ob")
+mitCol    = input.color(color.new(#787b86, 0), "Mitigated", group=gV)
+
+// ── Helpers ──
+gradeToScore(g) =>
+    g == "A+ only" ? 80.0 : g == "A and above" ? 65.0 : g == "B and above" ? 50.0 : 0.0
+minScore = gradeToScore(minGrade)
+letter(s) =>
+    s >= 80 ? "A+" : s >= 65 ? "A" : s >= 50 ? "B" : "C"
+
+// ── Shared series ──
+atrRaw = ta.atr(atrLen)
+atrv = atrRaw <= 0 ? syminfo.mintick : atrRaw
+emaTrend = ta.ema(close, trendLen)
+volSma = ta.sma(volume, volLen)
+loSweep = ta.lowest(low, sweepLook)
+hiSweep = ta.highest(high, sweepLook)
+hhPost = ta.highest(high, pivotLen)
+llPost = ta.lowest(low, pivotLen)
+phl = ta.pivotlow(pivotLen, pivotLen)
+phh = ta.pivothigh(pivotLen, pivotLen)
+var float lastSH = na
+var float lastSL = na
+if not na(phh)
+    lastSH := phh
+if not na(phl)
+    lastSL := phl
+
+// ── Zone store ──
+// kind: 0 = Rejection Block, 1 = FVG, 2 = Order Block
+type Zone
+    box   bx
+    line  ce
+    label lbl
+    float top
+    float bot
+    int   dir
+    int   kind
+    float score
+    bool  mit
+var array<Zone> zones = array.new<Zone>()
+
+zoneCol(int kind, int dir) =>
+    kind == 0 ? (dir == 1 ? rbColUp : rbColDn) : kind == 1 ? (dir == 1 ? fvgColUp : fvgColDn) : (dir == 1 ? obColUp : obColDn)
+kindName(int kind) =>
+    kind == 0 ? "RB" : kind == 1 ? "FVG" : "OB"
+
+addZone(int kind, int dir, float sc, int left, float top, float bot) =>
+    col = zoneCol(kind, dir)
+    bw = sc >= 80 ? 2 : 1
+    op = sc >= 80 ? 80 : sc >= 65 ? 87 : 92
+    bstyle = dir == 1 ? line.style_solid : line.style_dashed
+    bx = box.new(left, top, bar_index, bot, border_color=col, border_width=bw, border_style=bstyle, bgcolor=color.new(col, op), extend=extend.right)
+    lnv = line(na)
+    if showCE
+        mid = (top + bot) / 2.0
+        lnv := line.new(left, mid, bar_index, mid, color=color.new(col, 25), style=line.style_dashed, extend=extend.right)
+    lbv = label(na)
+    if showLbl
+        txt = kindName(kind) + (dir == 1 ? " ▲ " : " ▼ ") + letter(sc)
+        lbv := label.new(left, dir == 1 ? bot : top, txt, style=dir == 1 ? label.style_label_up : label.style_label_down, color=col, textcolor=color.white, size=size.small)
+    array.unshift(zones, Zone.new(bx, lnv, lbv, top, bot, dir, kind, sc, false))
+    if array.size(zones) > maxZones
+        old = array.pop(zones)
+        box.delete(old.bx)
+        if not na(old.ce)
+            line.delete(old.ce)
+        if not na(old.lbl)
+            label.delete(old.lbl)
+
+// ── Rejection Block score ──
+scoreRB(int dir) =>
+    p = pivotLen
+    rng = high[p] - low[p]
+    rng := rng <= 0 ? syminfo.mintick : rng
+    bodyEdge = dir == 1 ? math.min(open[p], close[p]) : math.max(open[p], close[p])
+    wick = dir == 1 ? bodyEdge - low[p] : high[p] - bodyEdge
+    wickRatio = wick / rng
+    rngSig = rng / atrv
+    disp = dir == 1 ? (hhPost - bodyEdge) / atrv : (bodyEdge - llPost) / atrv
+    vavg = volSma[p]
+    volr = vavg > 0 ? volume[p] / vavg : 1.0
+    pLow = loSweep[p + 1]
+    pHigh = hiSweep[p + 1]
+    swept = dir == 1 ? (low[p] < pLow and close[p] > pLow) : (high[p] > pHigh and close[p] < pHigh)
+    aligned = dir == 1 ? close[p] > emaTrend[p] : close[p] < emaTrend[p]
+    dq = wickRatio < minWick or rngSig < minRngATR
+    sc = -1.0
+    if not dq
+        raw = math.min(wickRatio, 1) * 25 + math.min(disp / 1.5, 1) * 25 + math.min(volr / 1.5, 1) * 15 + (swept ? 20 : 0) + (aligned ? 15 : 0)
+        sc := raw
+    sc
+
+// ── FVG score ──
+scoreFVG(int dir) =>
+    gap = dir == 1 ? low - high[2] : low[2] - high
+    gapA = gap / atrv
+    dispB = math.abs(close[1] - open[1]) / atrv
+    vavg = volSma[1]
+    volr = vavg > 0 ? volume[1] / vavg : 1.0
+    aligned = dir == 1 ? close > emaTrend : close < emaTrend
+    swept = dir == 1 ? (low[1] < loSweep[2]) : (high[1] > hiSweep[2])
+    dq = gapA < minGapATR
+    sc = -1.0
+    if not dq
+        raw = math.min(gapA / 1.0, 1) * 30 + math.min(dispB / 1.5, 1) * 25 + math.min(volr / 1.5, 1) * 15 + (aligned ? 15 : 0) + (swept ? 15 : 0)
+        sc := raw
+    sc
+
+// ── Detect & create ──
+newAplus = false
+
+// Rejection Blocks
+if enRB and not na(phl)
+    sc = scoreRB(1)
+    if sc >= minScore and sc >= 0
+        addZone(0, 1, sc, bar_index - pivotLen, math.min(open[pivotLen], close[pivotLen]), low[pivotLen])
+        newAplus := newAplus or sc >= 80
+if enRB and not na(phh)
+    sc = scoreRB(-1)
+    if sc >= minScore and sc >= 0
+        addZone(0, -1, sc, bar_index - pivotLen, high[pivotLen], math.max(open[pivotLen], close[pivotLen]))
+        newAplus := newAplus or sc >= 80
+
+// Fair Value Gaps
+if enFVG and low > high[2]
+    sc = scoreFVG(1)
+    if sc >= minScore and sc >= 0
+        addZone(1, 1, sc, bar_index - 2, low, high[2])
+        newAplus := newAplus or sc >= 80
+if enFVG and high < low[2]
+    sc = scoreFVG(-1)
+    if sc >= minScore and sc >= 0
+        addZone(1, -1, sc, bar_index - 2, low[2], high)
+        newAplus := newAplus or sc >= 80
+
+// Order Blocks (on BOS)
+detectOB(int dir) =>
+    k = -1
+    for j = 1 to scanBack
+        opp = dir == 1 ? close[j] < open[j] : close[j] > open[j]
+        if opp and k == -1
+            k := j
+    sc = -1.0
+    if k >= 0
+        hi = high[k]
+        lo = low[k]
+        legHi = ta.highest(high, k + 1)
+        legLo = ta.lowest(low, k + 1)
+        disp = dir == 1 ? (legHi - hi) / atrv : (lo - legLo) / atrv
+        fvg = false
+        for j = 0 to k - 2
+            if dir == 1 and low[j] > high[j + 2]
+                fvg := true
+            if dir == -1 and high[j] < low[j + 2]
+                fvg := true
+        vavg = volSma[k]
+        volr = vavg > 0 ? volume[k] / vavg : 1.0
+        aligned = dir == 1 ? close > emaTrend : close < emaTrend
+        swept = dir == 1 ? (low[k] < loSweep[k + 1]) : (high[k] > hiSweep[k + 1])
+        if disp >= minDispATR
+            raw = math.min(disp / 2.0, 1) * 25 + (fvg ? 20 : 0) + math.min(volr / 1.5, 1) * 15 + (aligned ? 15 : 0) + (swept ? 25 : 0)
+            sc := raw
+            if sc >= minScore
+                addZone(2, dir, sc, bar_index - k, hi, lo)
+    sc
+
+bosUp = enOB and not na(lastSH) and close > lastSH and close[1] <= lastSH
+bosDn = enOB and not na(lastSL) and close < lastSL and close[1] >= lastSL
+if bosUp
+    s = detectOB(1)
+    newAplus := newAplus or s >= 80
+if bosDn
+    s = detectOB(-1)
+    newAplus := newAplus or s >= 80
+
+// ── Mitigation + tap (per-kind rules) ──
+tapAplus = false
+mitAplus = false
+if array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        z = array.get(zones, i)
+        if not z.mit
+            done = z.kind == 1 ? (z.dir == 1 ? low <= z.bot : high >= z.top) : (z.dir == 1 ? close < z.bot : close > z.top)
+            if done
+                z.mit := true
+                z.bx.set_extend(extend.none)
+                z.bx.set_right(bar_index)
+                z.bx.set_bgcolor(color.new(mitCol, 90))
+                z.bx.set_border_color(color.new(mitCol, 40))
+                if not na(z.ce)
+                    z.ce.set_extend(extend.none)
+                    z.ce.set_x2(bar_index)
+                    z.ce.set_color(color.new(mitCol, 50))
+                if z.score >= 80
+                    mitAplus := true
+            else
+                if (low <= z.top and high >= z.bot) and z.score >= 80
+                    tapAplus := true
+
+// ── Overlap marker (informational only) ──
+if markOv and array.size(zones) > 1
+    n = array.size(zones)
+    for i = 0 to n - 1
+        zi = array.get(zones, i)
+        if not zi.mit
+            for j = i + 1 to n - 1
+                zj = array.get(zones, j)
+                if not zj.mit and zi.kind != zj.kind and zi.dir == zj.dir
+                    over = not (zi.top < zj.bot or zi.bot > zj.top)
+                    if over and (low <= math.max(zi.bot, zj.bot) and high >= math.min(zi.top, zj.top))
+                        label.new(bar_index, (math.max(zi.bot, zj.bot) + math.min(zi.top, zj.top)) / 2, "✦", style=label.style_none, textcolor=color.yellow, size=size.normal)
+
+// ── Dashboard ──
+if showTbl and barstate.islast
+    var table t = table.new(position.top_right, 2, 6, border_width=1)
+    cRB = 0
+    cFVG = 0
+    cOB = 0
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            z = array.get(zones, i)
+            if not z.mit and z.score >= 80
+                if z.kind == 0
+                    cRB += 1
+                if z.kind == 1
+                    cFVG += 1
+                if z.kind == 2
+                    cOB += 1
+    bias = close > emaTrend ? "Bullish ▲" : "Bearish ▼"
+    bc = close > emaTrend ? #26c4ad : #ef5350
+    table.cell(t, 0, 0, "A+ ICT Suite", text_color=color.white, bgcolor=color.new(color.gray, 0), text_size=size.small)
+    table.cell(t, 1, 0, "", bgcolor=color.new(color.gray, 0))
+    table.cell(t, 0, 1, "Bias", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 1, bias, text_color=color.white, bgcolor=color.new(bc, 20), text_size=size.small)
+    // concept rows are tinted with the zone colour → the table doubles as a legend
+    table.cell(t, 0, 2, "■ Rej. Blocks", text_color=color.white, bgcolor=color.new(rbColUp, 35), text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(cRB), text_color=color.white, bgcolor=color.new(rbColUp, 35), text_size=size.small)
+    table.cell(t, 0, 3, "■ Fair Value Gaps", text_color=color.white, bgcolor=color.new(fvgColUp, 35), text_size=size.small)
+    table.cell(t, 1, 3, str.tostring(cFVG), text_color=color.white, bgcolor=color.new(fvgColUp, 35), text_size=size.small)
+    table.cell(t, 0, 4, "■ Order Blocks", text_color=color.white, bgcolor=color.new(obColUp, 35), text_size=size.small)
+    table.cell(t, 1, 4, str.tostring(cOB), text_color=color.white, bgcolor=color.new(obColUp, 35), text_size=size.small)
+    table.cell(t, 0, 5, "Open A+ total", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 5, str.tostring(cRB + cFVG + cOB), text_color=color.white, text_size=size.small)
+
+// ── Alerts ──
+alertcondition(newAplus, "New A+ zone", "A new A+ ICT zone formed on {{ticker}} ({{interval}})")
+alertcondition(tapAplus, "Price tapped A+ zone", "Price tapped an A+ ICT zone on {{ticker}} ({{interval}})")
+alertcondition(mitAplus, "A+ zone mitigated", "An A+ ICT zone was invalidated on {{ticker}} ({{interval}})")
