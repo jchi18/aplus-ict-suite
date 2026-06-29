@@ -1,0 +1,258 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © rb — A+ Rejection Blocks
+//@version=6
+indicator("A+ Rejection Blocks [rb]", shorttitle="A+ RB", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  A+ REJECTION BLOCKS
+//  ------------------------------------------------------------------------
+//  A rejection block (ICT) is a price zone built from the WICK of a swing
+//  candle — the part of the move that was rejected. This script does not just
+//  draw every wick: it scores each candidate against five institutional
+//  confluences and only promotes the cleanest setups to "A+".
+//
+//  Grade engine (0–100):
+//    • Wick dominance   — how much of the candle is rejection vs body
+//    • Displacement     — conviction of the move away from the zone (ATR)
+//    • Liquidity sweep  — did the wick raid a prior swing then reverse?
+//    • Volume           — institutional participation vs average
+//    • Trend alignment  — is the rejection with the prevailing bias?
+//
+//  Grades:  A+ ≥ 80   |   A ≥ 65   |   B ≥ 50
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────── INPUTS ───────────────────────────────────
+gStruct   = "Structure"
+pivotLen  = input.int(5,   "Swing strength (pivot bars)", minval=1, maxval=50, group=gStruct, tooltip="Bars on each side required to confirm a swing high/low. Higher = fewer, stronger blocks. Blocks confirm this many bars after the swing.")
+sweepLook = input.int(20,  "Liquidity lookback",          minval=2, maxval=200, group=gStruct, tooltip="How far back to look for the prior swing that a wick must raid to count as a liquidity sweep.")
+
+gGrade    = "Grade engine"
+minGrade  = input.string("A+ only", "Minimum grade to plot", options=["A+ only", "A and above", "B and above", "Show all"], group=gGrade)
+wWick     = input.float(25, "Weight · Wick dominance",  minval=0, maxval=100, group=gGrade)
+wDisp     = input.float(25, "Weight · Displacement",    minval=0, maxval=100, group=gGrade)
+wSweep    = input.float(20, "Weight · Liquidity sweep", minval=0, maxval=100, group=gGrade)
+wVol      = input.float(15, "Weight · Volume",          minval=0, maxval=100, group=gGrade)
+wTrend    = input.float(15, "Weight · Trend alignment", minval=0, maxval=100, group=gGrade)
+
+gGate     = "Hard filters (disqualify if failed)"
+minWick   = input.float(0.5, "Min wick / range",        minval=0.0, maxval=1.0, step=0.05, group=gGate, tooltip="A real rejection candle's wick must be at least this fraction of its total range.")
+minRngATR = input.float(0.5, "Min candle range (ATR)",  minval=0.0, maxval=5.0, step=0.1,  group=gGate, tooltip="Ignore insignificant candles smaller than this multiple of ATR.")
+reqSweep  = input.bool(false, "Require liquidity sweep", group=gGate)
+reqTrend  = input.bool(false, "Require trend alignment", group=gGate)
+
+gCalib    = "Calibration targets"
+dispTgt   = input.float(1.5, "Displacement target (ATR)", minval=0.1, step=0.1, group=gCalib, tooltip="Move (in ATR) away from the zone that earns full displacement points.")
+volTgt    = input.float(1.5, "Volume target (× avg)",     minval=0.5, step=0.1, group=gCalib, tooltip="Volume multiple of average that earns full volume points.")
+atrLen    = input.int(14,  "ATR length",   minval=1, group=gCalib)
+volLen    = input.int(20,  "Volume avg length", minval=1, group=gCalib)
+trendLen  = input.int(50,  "Trend EMA length",  minval=1, group=gCalib)
+
+gView     = "Display"
+maxBlocks = input.int(12,  "Max blocks kept", minval=1, maxval=100, group=gView)
+showCE    = input.bool(true,  "Show 50% (CE) line", group=gView)
+showLbl   = input.bool(true,  "Show grade labels",  group=gView)
+showTrend = input.bool(false, "Plot trend EMA",     group=gView)
+extendN   = input.int(0,   "Extend mitigated blocks (bars)", minval=0, group=gView, tooltip="Keep an invalidated block on screen this many bars before freezing it.")
+bullCol   = input.color(#26a69a, "Bullish block", group=gView, inline="c1")
+bearCol   = input.color(#ef5350, "Bearish block", group=gView, inline="c1")
+mitCol    = input.color(color.new(#787b86, 0), "Mitigated", group=gView, inline="c1")
+showTable = input.bool(true,  "Show dashboard", group=gView)
+
+gAlert    = "Alerts"
+alertGrade = input.string("A+ only", "Alert on grade", options=["A+ only", "A and above", "B and above", "Show all"], group=gAlert)
+
+// ─────────────────────────── GRADE THRESHOLDS ─────────────────────────────
+gradeToScore(g) =>
+    g == "A+ only"      ? 80.0 :
+     g == "A and above" ? 65.0 :
+     g == "B and above" ? 50.0 : 0.0
+
+minScore   = gradeToScore(minGrade)
+alertScore = gradeToScore(alertGrade)
+
+letter(s) => s >= 80 ? "A+" : s >= 65 ? "A" : s >= 50 ? "B" : "C"
+
+// ─────────────────────────── GLOBAL SERIES ────────────────────────────────
+// All ta.* calls live in global scope so they evaluate every bar (consistent).
+atrRaw    = ta.atr(atrLen)
+atrv      = atrRaw <= 0 ? syminfo.mintick : atrRaw
+emaTrend  = ta.ema(close, trendLen)
+volSma    = ta.sma(volume, volLen)
+hhPost    = ta.highest(high, pivotLen)   // highest high of the bars after a swing
+llPost    = ta.lowest(low,  pivotLen)    // lowest low of the bars after a swing
+priorLowR = ta.lowest(low,  sweepLook)
+priorHighR= ta.highest(high, sweepLook)
+
+phl = ta.pivotlow(pivotLen, pivotLen)
+phh = ta.pivothigh(pivotLen, pivotLen)
+
+// ───────────────────────────── DATA TYPE ──────────────────────────────────
+type RB
+    box   bx
+    line  ce
+    label lbl
+    float top
+    float bot
+    int   dir        // 1 = bullish, -1 = bearish
+    float score
+    bool  mit
+    int   mitBar
+
+var array<RB> blocks = array.new<RB>()
+
+// ───────────────────────────── SCORING ────────────────────────────────────
+// dir: 1 bull (swing low), -1 bear (swing high). Returns score, or -1 if DQ'd.
+scoreRB(int dir) =>
+    p   = pivotLen
+    rng = high[p] - low[p]
+    rng := rng <= 0 ? syminfo.mintick : rng
+
+    bodyEdge = dir == 1 ? math.min(open[p], close[p]) : math.max(open[p], close[p])
+    wick     = dir == 1 ? bodyEdge - low[p] : high[p] - bodyEdge
+    wickRatio = wick / rng
+    rngSig    = rng / atrv
+
+    disp  = dir == 1 ? (hhPost - bodyEdge) / atrv : (bodyEdge - llPost) / atrv
+    vavg  = volSma[p]
+    volr  = vavg > 0 ? volume[p] / vavg : 1.0
+
+    pLow  = priorLowR[p + 1]
+    pHigh = priorHighR[p + 1]
+    swept = dir == 1 ? (low[p] < pLow and close[p] > pLow) : (high[p] > pHigh and close[p] < pHigh)
+    aligned = dir == 1 ? close[p] > emaTrend[p] : close[p] < emaTrend[p]
+
+    // hard gates
+    dq = wickRatio < minWick or rngSig < minRngATR or (reqSweep and not swept) or (reqTrend and not aligned)
+
+    sc = -1.0
+    if not dq
+        ptsWick  = math.min(wickRatio, 1.0)          * wWick
+        ptsDisp  = math.min(disp / dispTgt, 1.0)     * wDisp
+        ptsVol   = math.min(volr / volTgt, 1.0)      * wVol
+        ptsSweep = (swept ? 1.0 : 0.0)               * wSweep
+        ptsTrend = (aligned ? 1.0 : 0.0)             * wTrend
+        total    = wWick + wDisp + wSweep + wVol + wTrend
+        raw      = ptsWick + ptsDisp + ptsVol + ptsSweep + ptsTrend
+        sc := total > 0 ? raw / total * 100.0 : 0.0
+    sc
+
+// ───────────────────────────── BUILDERS ───────────────────────────────────
+gradeColor(int dir, float sc, bool mit) =>
+    base = dir == 1 ? bullCol : bearCol
+    mit ? mitCol : base
+
+addRB(int dir, float sc) =>
+    p    = pivotLen
+    left = bar_index - p
+    top  = dir == 1 ? math.min(open[p], close[p]) : high[p]
+    bot  = dir == 1 ? low[p] : math.max(open[p], close[p])
+    col  = gradeColor(dir, sc, false)
+    bw   = sc >= 80 ? 2 : 1
+    op   = sc >= 80 ? 80 : sc >= 65 ? 87 : 92
+
+    bx = box.new(left, top, bar_index, bot, border_color=col, border_width=bw, bgcolor=color.new(col, op), extend=extend.right)
+
+    ln = na
+    if showCE
+        mid = (top + bot) / 2.0
+        ln := line.new(left, mid, bar_index, mid, color=color.new(col, 25), style=line.style_dashed, extend=extend.right)
+
+    lb = na
+    if showLbl
+        txt = letter(sc) + "  " + str.tostring(sc, "#")
+        lb := label.new(left, dir == 1 ? bot : top, txt, style=dir == 1 ? label.style_label_up : label.style_label_down, color=col, textcolor=color.white, size=size.small)
+
+    rb = RB.new(bx, ln, lb, top, bot, dir, sc, false, na)
+    array.unshift(blocks, rb)
+
+    // cap object count — drop oldest
+    if array.size(blocks) > maxBlocks
+        old = array.pop(blocks)
+        box.delete(old.bx)
+        if not na(old.ce)
+            line.delete(old.ce)
+        if not na(old.lbl)
+            label.delete(old.lbl)
+
+// ──────────────────────── CREATE ON CONFIRMATION ──────────────────────────
+newAplus = false
+newAny   = false
+
+if not na(phl)
+    sc = scoreRB(1)
+    if sc >= minScore and sc >= 0
+        addRB(1, sc)
+        newAny := sc >= alertScore
+        newAplus := sc >= 80
+
+if not na(phh)
+    sc = scoreRB(-1)
+    if sc >= minScore and sc >= 0
+        addRB(-1, sc)
+        newAny := newAny or sc >= alertScore
+        newAplus := newAplus or sc >= 80
+
+// ──────────────────── MAINTENANCE: MITIGATION + TAP ───────────────────────
+tapAplus = false
+mitAplus = false
+
+if array.size(blocks) > 0
+    for i = array.size(blocks) - 1 to 0
+        rb = array.get(blocks, i)
+        if not rb.mit
+            broke = rb.dir == 1 ? close < rb.bot : close > rb.top
+            if broke
+                rb.mit   := true
+                rb.mitBar := bar_index
+                rb.bx.set_extend(extendN > 0 ? extend.right : extend.none)
+                rb.bx.set_right(bar_index + extendN)
+                rb.bx.set_bgcolor(color.new(mitCol, 90))
+                rb.bx.set_border_color(color.new(mitCol, 40))
+                if not na(rb.ce)
+                    rb.ce.set_extend(extend.none)
+                    rb.ce.set_x2(bar_index)
+                    rb.ce.set_color(color.new(mitCol, 50))
+                if rb.score >= 80
+                    mitAplus := true
+            else
+                // tapped = price entered the zone this bar
+                tapped = low <= rb.top and high >= rb.bot
+                if tapped and rb.score >= 80
+                    tapAplus := true
+        else if extendN > 0 and not na(rb.mitBar) and bar_index >= rb.mitBar + extendN
+            rb.bx.set_extend(extend.none)
+
+// ──────────────────────────── TREND PLOT ──────────────────────────────────
+plot(showTrend ? emaTrend : na, "Trend EMA", color=color.new(color.orange, 0), linewidth=1)
+
+// ───────────────────────────── DASHBOARD ──────────────────────────────────
+if showTable and barstate.islast
+    var table t = table.new(position.top_right, 2, 5, border_width=1)
+    actAplus = 0
+    actAll   = 0
+    if array.size(blocks) > 0
+        for i = 0 to array.size(blocks) - 1
+            rb = array.get(blocks, i)
+            if not rb.mit
+                actAll += 1
+                if rb.score >= 80
+                    actAplus += 1
+    bias = close > emaTrend ? "Bullish ▲" : "Bearish ▼"
+    biasC = close > emaTrend ? bullCol : bearCol
+
+    table.cell(t, 0, 0, "A+ Rejection Blocks", text_color=color.white, bgcolor=color.new(color.gray, 0), text_size=size.small)
+    table.cell(t, 1, 0, "", bgcolor=color.new(color.gray, 0))
+    table.cell(t, 0, 1, "Bias", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 1, bias, text_color=color.white, bgcolor=color.new(biasC, 20), text_size=size.small)
+    table.cell(t, 0, 2, "Active A+", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(actAplus), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 3, "Active (all)", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 3, str.tostring(actAll), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 4, "Min grade", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 4, minGrade, text_color=color.white, text_size=size.small)
+
+// ───────────────────────────── ALERTS ─────────────────────────────────────
+alertcondition(newAplus, "New A+ Rejection Block", "A new A+ rejection block formed on {{ticker}} ({{interval}})")
+alertcondition(newAny,   "New qualifying block",   "A new rejection block at/above alert grade formed on {{ticker}} ({{interval}})")
+alertcondition(tapAplus, "Price tapped A+ block",  "Price tapped an A+ rejection block on {{ticker}} ({{interval}}) — watch for reaction")
+alertcondition(mitAplus, "A+ block mitigated",     "An A+ rejection block was invalidated on {{ticker}} ({{interval}})")
