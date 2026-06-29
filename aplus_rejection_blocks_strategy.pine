@@ -1,0 +1,209 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © rb — A+ Rejection Blocks (Strategy)
+//@version=6
+strategy("A+ Rejection Blocks — Strategy [rb]", shorttitle="A+ RB Strat", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.04, slippage=2, pyramiding=0, max_boxes_count=200, max_lines_count=200, calc_on_every_tick=false, process_orders_on_close=true)
+
+// ── Detection / grade inputs (mirror the indicator) ──
+gS = "Structure"
+pivotLen  = input.int(5,  "Swing strength", minval=1, maxval=50, group=gS)
+sweepLook = input.int(20, "Liquidity lookback", minval=2, group=gS)
+gG = "Grade engine"
+minScore  = input.float(80, "Min grade score (A+=80)", minval=0, maxval=100, group=gG)
+wWick  = input.float(25, "W·Wick", group=gG)
+wDisp  = input.float(25, "W·Disp", group=gG)
+wSweep = input.float(20, "W·Sweep", group=gG)
+wVol   = input.float(15, "W·Vol", group=gG)
+wTrend = input.float(15, "W·Trend", group=gG)
+gF = "Hard filters"
+minWick   = input.float(0.5, "Min wick/range", minval=0, maxval=1, step=0.05, group=gF)
+minRngATR = input.float(0.5, "Min range (ATR)", minval=0, maxval=5, step=0.1, group=gF)
+reqSweep  = input.bool(false, "Require sweep", group=gF)
+reqTrend  = input.bool(false, "Require trend", group=gF)
+gC = "Calibration"
+dispTgt  = input.float(1.5, "Disp target (ATR)", minval=0.1, step=0.1, group=gC)
+volTgt   = input.float(1.5, "Vol target", minval=0.5, step=0.1, group=gC)
+atrLen   = input.int(14, "ATR len", minval=1, group=gC)
+volLen   = input.int(20, "Vol avg len", minval=1, group=gC)
+trendLen = input.int(50, "Trend EMA", minval=1, group=gC)
+
+// ── Exit / trade rules ──
+gT = "Exit rules"
+exitMode = input.string("Fixed RR", "Exit mode", options=["Fixed RR","Opposing liquidity","Partial + liquidity runner"], group=gT, tooltip="Backtest verdict (128 A+ trades, 12 markets): Fixed RR=1 was best (PF 1.37, +0.156R). Opposing-liquidity targets UNDER-performed.")
+rr       = input.float(1.0, "Fixed reward : risk", minval=0.2, step=0.1, group=gT)
+liqLook  = input.int(200, "Liquidity scan (bars)", minval=10, group=gT)
+liqMinRR = input.float(1.5, "Liquidity min RR", minval=0.2, step=0.1, group=gT)
+liqMaxRR = input.float(12.0, "Liquidity max RR cap", minval=1.0, step=0.5, group=gT)
+p1Pct    = input.float(70, "Partial size % at 1R", minval=10, maxval=90, step=5, group=gT)
+bufATR   = input.float(0.10, "Stop buffer (ATR)", minval=0, step=0.05, group=gT)
+armBars  = input.int(40, "Arm window (bars)", minval=1, group=gT)
+allowLong  = input.bool(true, "Longs (bullish RB)", group=gT, inline="ls")
+allowShort = input.bool(true, "Shorts (bearish RB)", group=gT, inline="ls")
+useDates = input.bool(false, "Limit date range", group=gT)
+fromDate = input.time(timestamp("2020-01-01"), "From", group=gT)
+toDate   = input.time(timestamp("2027-01-01"), "To", group=gT)
+inWindow = not useDates or (time >= fromDate and time <= toDate)
+
+// ── Global series ──
+atrRaw = ta.atr(atrLen)
+atrv = atrRaw <= 0 ? syminfo.mintick : atrRaw
+emaTrend = ta.ema(close, trendLen)
+volSma = ta.sma(volume, volLen)
+hhPost = ta.highest(high, pivotLen)
+llPost = ta.lowest(low, pivotLen)
+priorLowR = ta.lowest(low, sweepLook)
+priorHighR = ta.highest(high, sweepLook)
+phl = ta.pivotlow(pivotLen, pivotLen)
+phh = ta.pivothigh(pivotLen, pivotLen)
+
+scoreRB(int dir) =>
+    p = pivotLen
+    rng = high[p] - low[p]
+    rng := rng <= 0 ? syminfo.mintick : rng
+    bodyEdge = dir == 1 ? math.min(open[p], close[p]) : math.max(open[p], close[p])
+    wick = dir == 1 ? bodyEdge - low[p] : high[p] - bodyEdge
+    wickRatio = wick / rng
+    rngSig = rng / atrv
+    disp = dir == 1 ? (hhPost - bodyEdge) / atrv : (bodyEdge - llPost) / atrv
+    vavg = volSma[p]
+    volr = vavg > 0 ? volume[p] / vavg : 1.0
+    pLow = priorLowR[p + 1]
+    pHigh = priorHighR[p + 1]
+    swept = dir == 1 ? (low[p] < pLow and close[p] > pLow) : (high[p] > pHigh and close[p] < pHigh)
+    aligned = dir == 1 ? close[p] > emaTrend[p] : close[p] < emaTrend[p]
+    dq = wickRatio < minWick or rngSig < minRngATR or (reqSweep and not swept) or (reqTrend and not aligned)
+    sc = -1.0
+    if not dq
+        raw = math.min(wickRatio, 1) * wWick + math.min(disp / dispTgt, 1) * wDisp + math.min(volr / volTgt, 1) * wVol + (swept ? wSweep : 0) + (aligned ? wTrend : 0)
+        tot = wWick + wDisp + wSweep + wVol + wTrend
+        sc := tot > 0 ? raw / tot * 100 : 0
+    sc
+
+// ── Liquidity pools: confirmed swing levels (no lookahead) ──
+var array<float> shLvl = array.new<float>()
+var array<int>   shBar = array.new<int>()
+var array<float> slLvl = array.new<float>()
+var array<int>   slBar = array.new<int>()
+pushLvl(array<float> lv, array<int> bb, float v) =>
+    array.unshift(lv, v)
+    array.unshift(bb, bar_index)
+    if array.size(lv) > 200
+        array.pop(lv)
+        array.pop(bb)
+if not na(phh)
+    pushLvl(shLvl, shBar, high[pivotLen])
+if not na(phl)
+    pushLvl(slLvl, slBar, low[pivotLen])
+
+findLiq(int dir, float entry) =>
+    best = float(na)
+    if dir == 1
+        if array.size(shLvl) > 0
+            for k = 0 to array.size(shLvl) - 1
+                lv = array.get(shLvl, k)
+                if (bar_index - array.get(shBar, k)) <= liqLook and lv > entry
+                    best := na(best) ? lv : math.min(best, lv)
+    else
+        if array.size(slLvl) > 0
+            for k = 0 to array.size(slLvl) - 1
+                lv = array.get(slLvl, k)
+                if (bar_index - array.get(slBar, k)) <= liqLook and lv < entry
+                    best := na(best) ? lv : math.max(best, lv)
+    best
+
+// ── Armed A+ blocks ──
+type Arm
+    float top
+    float bot
+    int   dir
+    int   born
+var array<Arm> arms = array.new<Arm>()
+addArm(int dir) =>
+    p = pivotLen
+    top = dir == 1 ? math.min(open[p], close[p]) : high[p]
+    bot = dir == 1 ? low[p] : math.max(open[p], close[p])
+    array.unshift(arms, Arm.new(top, bot, dir, bar_index))
+    if array.size(arms) > 50
+        array.pop(arms)
+if not na(phl) and scoreRB(1) >= minScore
+    addArm(1)
+if not na(phh) and scoreRB(-1) >= minScore
+    addArm(-1)
+
+// ── Position state ──
+var float ePrice = na
+var float eStop = na
+var float eRisk = na
+var float eTgt = na
+var float eTp1 = na
+var int   posDir = 0
+var bool  tookTp1 = false
+var line  tgtLn = na
+
+computeTarget(int dir, float entry, float stop) =>
+    risk = math.abs(entry - stop)
+    risk := risk <= 0 ? syminfo.mintick : risk
+    fixed = dir == 1 ? entry + rr * risk : entry - rr * risk
+    t = fixed
+    if exitMode != "Fixed RR"
+        liq = findLiq(dir, entry)
+        if not na(liq)
+            rrr = math.abs(liq - entry) / risk
+            if rrr < liqMinRR
+                t := fixed
+            else
+                capped = math.min(rrr, liqMaxRR)
+                t := dir == 1 ? entry + capped * risk : entry - capped * risk
+    t
+
+// ── Entry: first tap of an armed block when flat ──
+flat = strategy.position_size == 0
+if array.size(arms) > 0
+    keep = array.new<Arm>()
+    entered = false
+    for i = 0 to array.size(arms) - 1
+        a = array.get(arms, i)
+        broke = a.dir == 1 ? close < a.bot : close > a.top
+        aged = (bar_index - a.born) > armBars
+        tapped = low <= a.top and high >= a.bot
+        allow = a.dir == 1 ? allowLong : allowShort
+        if not (broke or aged)
+            if flat and not entered and tapped and allow and inWindow
+                entry = a.dir == 1 ? a.top : a.bot
+                buf = bufATR * atrv
+                stop = a.dir == 1 ? a.bot - buf : a.top + buf
+                ePrice := entry
+                eStop := stop
+                eRisk := math.abs(entry - stop)
+                posDir := a.dir
+                tookTp1 := false
+                eTp1 := a.dir == 1 ? entry + eRisk : entry - eRisk
+                eTgt := computeTarget(a.dir, entry, stop)
+                if a.dir == 1
+                    strategy.entry("L", strategy.long)
+                else
+                    strategy.entry("S", strategy.short)
+                box.new(a.born, a.top, bar_index, a.bot, border_color=a.dir == 1 ? color.teal : color.red, bgcolor=color.new(a.dir == 1 ? color.teal : color.red, 85))
+                if not na(tgtLn)
+                    line.delete(tgtLn)
+                tgtLn := line.new(bar_index, eTgt, bar_index + 5, eTgt, color=color.new(color.yellow, 0), style=line.style_dotted, width=1)
+                entered := true
+            else
+                array.push(keep, a)
+    arms := keep
+
+// ── Exit management ──
+if strategy.position_size != 0
+    id = posDir == 1 ? "L" : "S"
+    if exitMode == "Partial + liquidity runner"
+        if not tookTp1
+            t1 = posDir == 1 ? high >= eTp1 : low <= eTp1
+            if t1
+                tookTp1 := true
+        rStop = tookTp1 ? ePrice : eStop
+        strategy.exit("tp1", id, qty_percent=p1Pct, stop=eStop, limit=eTp1)
+        strategy.exit("run", id, stop=rStop, limit=eTgt)
+    else
+        strategy.exit("x", id, stop=eStop, limit=eTgt)
+else
+    posDir := 0
+    tookTp1 := false
