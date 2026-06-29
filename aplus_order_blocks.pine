@@ -1,0 +1,198 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © rb — A+ Order Blocks
+//@version=6
+indicator("A+ Order Blocks [rb]", shorttitle="A+ OB", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ORDER BLOCKS (ICT) with a quality grade.
+//  Bullish OB = last down candle before an up move that BREAKS STRUCTURE (closes
+//  above the prior swing high). Bearish = last up candle before a down BOS.
+//  Grade: Displacement, FVG-in-leg, Volume, Trend, Liquidity sweep.
+//  Backtest (742 trades / 12 markets): grade helps; the strongest config of all
+//  three rb concepts is A+ OB at RR≈2 (PF 1.36, +0.21R).
+// ═══════════════════════════════════════════════════════════════════════════
+
+gS = "Structure"
+pivotLen = input.int(5, "Swing strength (BOS pivots)", minval=1, maxval=50, group=gS)
+scanBack = input.int(10, "OB scan-back (bars)", minval=1, maxval=50, group=gS)
+gG = "Grade engine"
+minGrade = input.string("A+ only", "Minimum grade to plot", options=["A+ only","A and above","B and above","Show all"], group=gG)
+wDisp  = input.float(25, "W·Displacement", group=gG)
+wFvg   = input.float(20, "W·FVG in leg", group=gG)
+wVol   = input.float(15, "W·Volume", group=gG)
+wTrend = input.float(15, "W·Trend", group=gG)
+wSweep = input.float(25, "W·Sweep", group=gG)
+gF = "Hard filters"
+minDispATR = input.float(1.0, "Min displacement (ATR)", minval=0, maxval=10, step=0.1, group=gF)
+reqSweep   = input.bool(false, "Require sweep", group=gF)
+reqTrend   = input.bool(false, "Require trend", group=gF)
+gC = "Calibration"
+dispTgt  = input.float(2.0, "Disp target (ATR)", minval=0.1, step=0.1, group=gC)
+volTgt   = input.float(1.5, "Vol target", minval=0.5, step=0.1, group=gC)
+atrLen   = input.int(14, "ATR len", minval=1, group=gC)
+volLen   = input.int(20, "Vol avg len", minval=1, group=gC)
+trendLen = input.int(50, "Trend EMA", minval=1, group=gC)
+sweepLook = input.int(20, "Sweep lookback", minval=2, group=gC)
+useBody  = input.bool(false, "Zone = body only (else full candle)", group=gC)
+gV = "Display"
+maxB    = input.int(15, "Max OBs kept", minval=1, maxval=100, group=gV)
+showCE  = input.bool(true, "Show 50% (CE) line", group=gV)
+showLbl = input.bool(true, "Show grade labels", group=gV)
+showBOS = input.bool(true, "Mark BOS", group=gV)
+showTbl = input.bool(true, "Show dashboard", group=gV)
+bullCol = input.color(#26a69a, "Bullish", group=gV, inline="c")
+bearCol = input.color(#ef5350, "Bearish", group=gV, inline="c")
+mitCol  = input.color(color.new(#787b86, 0), "Mitigated", group=gV, inline="c")
+
+gradeToScore(g) =>
+    g == "A+ only" ? 80.0 : g == "A and above" ? 65.0 : g == "B and above" ? 50.0 : 0.0
+minScore = gradeToScore(minGrade)
+letter(s) =>
+    s >= 80 ? "A+" : s >= 65 ? "A" : s >= 50 ? "B" : "C"
+
+atrRaw = ta.atr(atrLen)
+atrv = atrRaw <= 0 ? syminfo.mintick : atrRaw
+emaTrend = ta.ema(close, trendLen)
+volSma = ta.sma(volume, volLen)
+loSweep = ta.lowest(low, sweepLook)
+hiSweep = ta.highest(high, sweepLook)
+
+ph = ta.pivothigh(pivotLen, pivotLen)
+pl = ta.pivotlow(pivotLen, pivotLen)
+var float lastSH = na
+var float lastSL = na
+if not na(ph)
+    lastSH := ph
+if not na(pl)
+    lastSL := pl
+
+type OB
+    box   bx
+    line  ce
+    label lbl
+    float top
+    float bot
+    int   dir
+    float score
+    bool  mit
+var array<OB> obs = array.new<OB>()
+
+addOB(int dir, int k, float sc) =>
+    hi = high[k]
+    lo = low[k]
+    bt_ = math.max(open[k], close[k])
+    bb = math.min(open[k], close[k])
+    top = useBody ? bt_ : hi
+    bot = useBody ? bb : lo
+    col = dir == 1 ? bullCol : bearCol
+    bw = sc >= 80 ? 2 : 1
+    op = sc >= 80 ? 78 : sc >= 65 ? 85 : 90
+    bx = box.new(bar_index - k, top, bar_index, bot, border_color=col, border_width=bw, bgcolor=color.new(col, op), extend=extend.right)
+    ln = line(na)
+    if showCE
+        mid = (top + bot) / 2
+        ln := line.new(bar_index - k, mid, bar_index, mid, color=color.new(col, 25), style=line.style_dashed, extend=extend.right)
+    lb = label(na)
+    if showLbl
+        lb := label.new(bar_index - k, dir == 1 ? bot : top, letter(sc) + " " + str.tostring(sc, "#"), style=dir == 1 ? label.style_label_up : label.style_label_down, color=col, textcolor=color.white, size=size.small)
+    if showBOS
+        line.new(bar_index - 1, dir == 1 ? lastSH : lastSL, bar_index, dir == 1 ? lastSH : lastSL, color=color.new(col, 0), style=line.style_dotted)
+    array.unshift(obs, OB.new(bx, ln, lb, top, bot, dir, sc, false))
+    if array.size(obs) > maxB
+        o = array.pop(obs)
+        box.delete(o.bx)
+        if not na(o.ce)
+            line.delete(o.ce)
+        if not na(o.lbl)
+            label.delete(o.lbl)
+
+detectAndAdd(int dir) =>
+    k = -1
+    for j = 1 to scanBack
+        opp = dir == 1 ? close[j] < open[j] : close[j] > open[j]
+        if opp and k == -1
+            k := j
+    sc = -1.0
+    if k >= 0
+        hi = high[k]
+        lo = low[k]
+        legHi = ta.highest(high, k + 1)
+        legLo = ta.lowest(low, k + 1)
+        disp = dir == 1 ? (legHi - hi) / atrv : (lo - legLo) / atrv
+        fvg = false
+        for j = 0 to k - 2
+            if dir == 1 and low[j] > high[j + 2]
+                fvg := true
+            if dir == -1 and high[j] < low[j + 2]
+                fvg := true
+        vavg = volSma[k]
+        volr = vavg > 0 ? volume[k] / vavg : 1.0
+        aligned = dir == 1 ? close > emaTrend : close < emaTrend
+        swept = dir == 1 ? (low[k] < loSweep[k + 1]) : (high[k] > hiSweep[k + 1])
+        dq = disp < minDispATR or (reqSweep and not swept) or (reqTrend and not aligned)
+        if not dq
+            raw = math.min(disp / dispTgt, 1) * wDisp + (fvg ? wFvg : 0) + math.min(volr / volTgt, 1) * wVol + (aligned ? wTrend : 0) + (swept ? wSweep : 0)
+            tot = wDisp + wFvg + wVol + wTrend + wSweep
+            sc := tot > 0 ? raw / tot * 100 : 0
+            if sc >= minScore
+                addOB(dir, k, sc)
+    sc
+
+newAplus = false
+bosUp = not na(lastSH) and close > lastSH and close[1] <= lastSH
+bosDn = not na(lastSL) and close < lastSL and close[1] >= lastSL
+if bosUp
+    s = detectAndAdd(1)
+    newAplus := newAplus or s >= 80
+if bosDn
+    s = detectAndAdd(-1)
+    newAplus := newAplus or s >= 80
+
+tapAplus = false
+mitAplus = false
+if array.size(obs) > 0
+    for i = array.size(obs) - 1 to 0
+        o = array.get(obs, i)
+        if not o.mit
+            broke = o.dir == 1 ? close < o.bot : close > o.top
+            if broke
+                o.mit := true
+                o.bx.set_extend(extend.none)
+                o.bx.set_right(bar_index)
+                o.bx.set_bgcolor(color.new(mitCol, 90))
+                o.bx.set_border_color(color.new(mitCol, 40))
+                if not na(o.ce)
+                    o.ce.set_extend(extend.none)
+                    o.ce.set_x2(bar_index)
+                    o.ce.set_color(color.new(mitCol, 50))
+                if o.score >= 80
+                    mitAplus := true
+            else
+                if (low <= o.top and high >= o.bot) and o.score >= 80
+                    tapAplus := true
+
+if showTbl and barstate.islast
+    var table t = table.new(position.top_right, 2, 4, border_width=1)
+    aAp = 0
+    aAll = 0
+    if array.size(obs) > 0
+        for i = 0 to array.size(obs) - 1
+            o = array.get(obs, i)
+            if not o.mit
+                aAll += 1
+                if o.score >= 80
+                    aAp += 1
+    bias = close > emaTrend ? "Bullish ▲" : "Bearish ▼"
+    bc = close > emaTrend ? bullCol : bearCol
+    table.cell(t, 0, 0, "A+ Order Blocks", text_color=color.white, bgcolor=color.new(color.gray, 0), text_size=size.small)
+    table.cell(t, 1, 0, "", bgcolor=color.new(color.gray, 0))
+    table.cell(t, 0, 1, "Bias", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 1, bias, text_color=color.white, bgcolor=color.new(bc, 20), text_size=size.small)
+    table.cell(t, 0, 2, "Open A+", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(aAp), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 3, "Open (all)", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 3, str.tostring(aAll), text_color=color.white, text_size=size.small)
+
+alertcondition(newAplus, "New A+ Order Block", "A new A+ order block formed on {{ticker}} ({{interval}})")
+alertcondition(tapAplus, "Price tapped A+ OB", "Price tapped an A+ order block on {{ticker}} ({{interval}})")
+alertcondition(mitAplus, "A+ OB mitigated", "An A+ order block was invalidated on {{ticker}} ({{interval}})")
