@@ -1,0 +1,166 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © rb — A+ Fair Value Gaps
+//@version=6
+indicator("A+ Fair Value Gaps [rb]", shorttitle="A+ FVG", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  FAIR VALUE GAPS (ICT imbalance) with a quality grade.
+//  Bullish FVG = 3-candle gap where low[0] > high[2]. Bearish = high[0] < low[2].
+//  NOTE (backtest, 17,750 trades / 12 markets): the GRADE is roughly flat for
+//  FVGs — the edge is the gap itself, and FVGs are CONTINUATION zones that prefer
+//  WIDER targets (RR 2-3). A+ only will show very few; lower the min grade if you
+//  want more gaps (they perform about the same regardless of grade).
+// ═══════════════════════════════════════════════════════════════════════════
+
+gG = "Grade engine"
+minGrade = input.string("A+ only", "Minimum grade to plot", options=["A+ only","A and above","B and above","Show all"], group=gG)
+wGap   = input.float(30, "W·Gap size", group=gG)
+wDisp  = input.float(25, "W·Displacement", group=gG)
+wVol   = input.float(15, "W·Volume", group=gG)
+wTrend = input.float(15, "W·Trend", group=gG)
+wSweep = input.float(15, "W·Sweep", group=gG)
+gF = "Hard filters"
+minGapATR = input.float(0.25, "Min gap size (ATR)", minval=0, maxval=3, step=0.05, group=gF)
+reqTrend  = input.bool(false, "Require trend alignment", group=gF)
+gC = "Calibration"
+gapTgt   = input.float(1.0, "Gap target (ATR)", minval=0.1, step=0.1, group=gC)
+dispTgt  = input.float(1.5, "Disp target (ATR)", minval=0.1, step=0.1, group=gC)
+volTgt   = input.float(1.5, "Vol target", minval=0.5, step=0.1, group=gC)
+atrLen   = input.int(14, "ATR len", minval=1, group=gC)
+volLen   = input.int(20, "Vol avg len", minval=1, group=gC)
+trendLen = input.int(50, "Trend EMA", minval=1, group=gC)
+sweepLook = input.int(20, "Sweep lookback", minval=2, group=gC)
+gV = "Display"
+maxB     = input.int(20, "Max FVGs kept", minval=1, maxval=100, group=gV)
+fillMode = input.string("Full fill", "Mitigate when", options=["Full fill","50% (CE) touch","Close through"], group=gV)
+showCE   = input.bool(true, "Show 50% (CE) line", group=gV)
+showLbl  = input.bool(true, "Show grade labels", group=gV)
+showTbl  = input.bool(true, "Show dashboard", group=gV)
+bullCol  = input.color(#26a69a, "Bullish", group=gV, inline="c")
+bearCol  = input.color(#ef5350, "Bearish", group=gV, inline="c")
+mitCol   = input.color(color.new(#787b86, 0), "Mitigated", group=gV, inline="c")
+
+gradeToScore(g) =>
+    g == "A+ only" ? 80.0 : g == "A and above" ? 65.0 : g == "B and above" ? 50.0 : 0.0
+minScore = gradeToScore(minGrade)
+letter(s) =>
+    s >= 80 ? "A+" : s >= 65 ? "A" : s >= 50 ? "B" : "C"
+
+atrRaw = ta.atr(atrLen)
+atrv = atrRaw <= 0 ? syminfo.mintick : atrRaw
+emaTrend = ta.ema(close, trendLen)
+volSma = ta.sma(volume, volLen)
+loSweep = ta.lowest(low, sweepLook)
+hiSweep = ta.highest(high, sweepLook)
+
+type FVG
+    box   bx
+    line  ce
+    label lbl
+    float top
+    float bot
+    int   dir
+    float score
+    bool  mit
+var array<FVG> fvgs = array.new<FVG>()
+
+scoreFVG(int dir) =>
+    gap = dir == 1 ? low - high[2] : low[2] - high
+    gapA = gap / atrv
+    dispB = math.abs(close[1] - open[1]) / atrv
+    vavg = volSma[1]
+    volr = vavg > 0 ? volume[1] / vavg : 1.0
+    aligned = dir == 1 ? close > emaTrend : close < emaTrend
+    swept = dir == 1 ? (low[1] < loSweep[2]) : (high[1] > hiSweep[2])
+    dq = gapA < minGapATR or (reqTrend and not aligned)
+    sc = -1.0
+    if not dq
+        raw = math.min(gapA / gapTgt, 1) * wGap + math.min(dispB / dispTgt, 1) * wDisp + math.min(volr / volTgt, 1) * wVol + (aligned ? wTrend : 0) + (swept ? wSweep : 0)
+        tot = wGap + wDisp + wVol + wTrend + wSweep
+        sc := tot > 0 ? raw / tot * 100 : 0
+    sc
+
+addFVG(int dir, float sc) =>
+    top = dir == 1 ? low : low[2]
+    bot = dir == 1 ? high[2] : high
+    col = dir == 1 ? bullCol : bearCol
+    bw = sc >= 80 ? 2 : 1
+    op = sc >= 80 ? 78 : sc >= 65 ? 85 : 90
+    bx = box.new(bar_index - 2, top, bar_index, bot, border_color=col, border_width=bw, bgcolor=color.new(col, op), extend=extend.right)
+    ln = line(na)
+    if showCE
+        mid = (top + bot) / 2
+        ln := line.new(bar_index - 2, mid, bar_index, mid, color=color.new(col, 25), style=line.style_dashed, extend=extend.right)
+    lb = label(na)
+    if showLbl
+        lb := label.new(bar_index, dir == 1 ? bot : top, letter(sc) + " " + str.tostring(sc, "#"), style=dir == 1 ? label.style_label_up : label.style_label_down, color=col, textcolor=color.white, size=size.small)
+    array.unshift(fvgs, FVG.new(bx, ln, lb, top, bot, dir, sc, false))
+    if array.size(fvgs) > maxB
+        o = array.pop(fvgs)
+        box.delete(o.bx)
+        if not na(o.ce)
+            line.delete(o.ce)
+        if not na(o.lbl)
+            label.delete(o.lbl)
+
+newAplus = false
+if low > high[2]
+    sc = scoreFVG(1)
+    if sc >= minScore and sc >= 0
+        addFVG(1, sc)
+        newAplus := newAplus or sc >= 80
+if high < low[2]
+    sc = scoreFVG(-1)
+    if sc >= minScore and sc >= 0
+        addFVG(-1, sc)
+        newAplus := newAplus or sc >= 80
+
+tapAplus = false
+mitAplus = false
+if array.size(fvgs) > 0
+    for i = array.size(fvgs) - 1 to 0
+        f = array.get(fvgs, i)
+        if not f.mit
+            mid = (f.top + f.bot) / 2
+            done = fillMode == "Full fill" ? (f.dir == 1 ? low <= f.bot : high >= f.top) : fillMode == "50% (CE) touch" ? (f.dir == 1 ? low <= mid : high >= mid) : (f.dir == 1 ? close < f.bot : close > f.top)
+            if done
+                f.mit := true
+                f.bx.set_extend(extend.none)
+                f.bx.set_right(bar_index)
+                f.bx.set_bgcolor(color.new(mitCol, 90))
+                f.bx.set_border_color(color.new(mitCol, 40))
+                if not na(f.ce)
+                    f.ce.set_extend(extend.none)
+                    f.ce.set_x2(bar_index)
+                    f.ce.set_color(color.new(mitCol, 50))
+                if f.score >= 80
+                    mitAplus := true
+            else
+                if (low <= f.top and high >= f.bot) and f.score >= 80
+                    tapAplus := true
+
+if showTbl and barstate.islast
+    var table t = table.new(position.top_right, 2, 4, border_width=1)
+    aAp = 0
+    aAll = 0
+    if array.size(fvgs) > 0
+        for i = 0 to array.size(fvgs) - 1
+            f = array.get(fvgs, i)
+            if not f.mit
+                aAll += 1
+                if f.score >= 80
+                    aAp += 1
+    bias = close > emaTrend ? "Bullish ▲" : "Bearish ▼"
+    bc = close > emaTrend ? bullCol : bearCol
+    table.cell(t, 0, 0, "A+ Fair Value Gaps", text_color=color.white, bgcolor=color.new(color.gray, 0), text_size=size.small)
+    table.cell(t, 1, 0, "", bgcolor=color.new(color.gray, 0))
+    table.cell(t, 0, 1, "Bias", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 1, bias, text_color=color.white, bgcolor=color.new(bc, 20), text_size=size.small)
+    table.cell(t, 0, 2, "Open A+", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(aAp), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 3, "Open (all)", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 3, str.tostring(aAll), text_color=color.white, text_size=size.small)
+
+alertcondition(newAplus, "New A+ FVG", "A new A+ fair value gap formed on {{ticker}} ({{interval}})")
+alertcondition(tapAplus, "Price tapped A+ FVG", "Price tapped an A+ FVG on {{ticker}} ({{interval}})")
+alertcondition(mitAplus, "A+ FVG mitigated", "An A+ FVG was filled/mitigated on {{ticker}} ({{interval}})")
